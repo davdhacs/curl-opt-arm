@@ -81,19 +81,11 @@ jobs:
           path: ~/pkg/mbedtls
           key: bench-${{ runner.os }}-mbedtls-${{ env.MBEDTLS_VERSION }}-${{ runner.arch }}
 
-      - name: 'cache build tree + autotools outputs'
+      - name: 'cache build tree (bld/)'
         id: cache-bld
         uses: actions/cache@v6
         with:
-          path: |
-            bld/
-            configure
-            Makefile.in
-            missing
-            install-sh
-            compile
-            depcomp
-            aclocal.m4
+          path: bld/
           key: bench-bld-${{ runner.arch }}-${{ github.sha }}
           restore-keys: |
             bench-bld-${{ runner.arch }}-
@@ -147,14 +139,24 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           STAMP=$(( $(git log -1 --format=%ct HEAD) - 30 ))
           T0=$(date +%s%3N)
-          if [ -f bld/Makefile ] && [ configure.ac -ot bld/Makefile ]; then
+          # Always autoreconf (7-9s): generates all subdirectory Makefile.in
+          # files that the bld/ Makefiles reference. The stamping after
+          # prevents make from regenerating on top of them.
+          autoreconf -fi
+          # Stamp autoreconf outputs to STAMP (same as bld/) so make
+          # does not regenerate Makefiles from newer-looking .in files
+          find . -maxdepth 1 -name "configure" -o -name "Makefile.in" -o -name "missing" -o -name "install-sh" -o -name "aclocal.m4" | xargs -r touch -d @$STAMP
+          find lib src docs tests -name "Makefile.in" 2>/dev/null | xargs -r touch -d @$STAMP
+          
+          if [ -f bld/Makefile ]; then
+            # warm: bld/ restored from cache, skip configure, make decides
             find bld -type f -exec touch -d @$STAMP {} +
             git ls-files --others --exclude-standard -z | xargs -0 -r touch -d @$STAMP
             git ls-files --others --ignored --exclude-standard -z | xargs -0 -r touch -d @$STAMP
             make -C bld V=1 AUTOCONF=true AUTOMAKE=true AUTOHEADER=true
             find bld -type f -exec touch {} +
           else
-            autoreconf -fi
+            # cold: full configure + make
             mkdir bld && cd bld
             ../configure --prefix="$HOME"/curl-install --enable-unity --enable-warnings --enable-werror --disable-static \
               --disable-dependency-tracking --enable-option-checking=fatal \
