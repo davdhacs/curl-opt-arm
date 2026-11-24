@@ -81,11 +81,19 @@ jobs:
           path: ~/pkg/mbedtls
           key: bench-${{ runner.os }}-mbedtls-${{ env.MBEDTLS_VERSION }}-${{ runner.arch }}
 
-      - name: 'cache build tree (bld/)'
+      - name: 'cache build tree + autotools outputs'
         id: cache-bld
         uses: actions/cache@v6
         with:
-          path: bld/
+          path: |
+            bld/
+            configure
+            Makefile.in
+            missing
+            install-sh
+            compile
+            depcomp
+            aclocal.m4
           key: bench-bld-${{ runner.arch }}-${{ github.sha }}
           restore-keys: |
             bench-bld-${{ runner.arch }}-
@@ -109,6 +117,28 @@ jobs:
         run: |
           echo "RESULT dep_cache hit=${{ steps.cache-mbedtls.outputs.cache-hit }}"
           echo "RESULT bld_cache hit=${{ steps.cache-bld.outputs.cache-hit }} key=${{ steps.cache-bld.outputs.cache-matched-key }}"
+
+      - name: Normalize source mtimes to commit dates (after cache restore)
+        run: |
+          python3 << 'PYEOF'
+          import subprocess, os, time
+          log = subprocess.run(['git','log','--format=%ct','--name-only'], capture_output=True, text=True).stdout
+          seen = set(); cur = None; stamped = 0
+          for line in log.splitlines():
+              if not line: continue
+              if line.isdigit():
+                  cur = int(line); continue
+              f = line
+              if f in seen or not os.path.exists(f): continue
+              os.utime(f, (cur, cur)); seen.add(f); stamped += 1
+          print(f"stamped {stamped} files")
+          ts = sorted(os.stat(f).st_mtime for f in seen)
+          print("  min:", time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts[0])))
+          print("  max:", time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts[-1])))
+          print("  now:", time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+          PYEOF
+          git update-index --really-refresh > /dev/null 2>&1 || true
+          echo "RESULT mtime_norm done"
 
       - name: "Build curl (incremental via mtime normalization)"
         env:
