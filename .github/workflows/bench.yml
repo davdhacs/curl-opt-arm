@@ -1,0 +1,153 @@
+name: bench
+# Arm D: the incumbent (actions/cache) optimized — same mtime technique
+# as arm C but using only GitHub's native caching. Isolates "what does
+# mtime normalization buy within the existing paradigm" from "what
+# requires brine's content-addressed receipts."
+#
+# Changes from arm A:
+#   W1 fix: cache bld/ (build tree) with restore-keys fallback
+#   W2 fix: skip autoreconf+configure when bld/Makefile exists
+#   W3 fix: normalize source mtimes to commit dates, bld/ to prev commit
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: 'curl commit SHA to replay (default: master~1)'
+        required: false
+        type: string
+
+permissions:
+  actions: write
+
+env:
+  MBEDTLS_VERSION: 4.3.0
+  MAKEFLAGS: -j 5
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Runner record + calibration probe
+        run: |
+          { date -u +%FT%TZ; grep -m1 'model name' /proc/cpuinfo; echo "nproc=$(nproc)"; } | tee "$RUNNER_TEMP/runner.txt"
+          curl -sSfLO https://sqlite.org/2024/sqlite-amalgamation-3450100.zip
+          unzip -q sqlite-amalgamation-3450100.zip
+          cd sqlite-amalgamation-3450100
+          for i in 1 2 3; do
+            rm -f sqlite3.o
+            S=$(date +%s%3N); gcc -O2 -c sqlite3.c; E=$(date +%s%3N)
+            echo "calib_ms=$((E-S))"
+          done | tee "$RUNNER_TEMP/calib.txt"
+
+      - name: Checkout curl at the target commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || 'master~1' }}
+          fetch-depth: 0
+
+      - name: Install prereqs (curl's own package list)
+        run: |
+          sudo apt-get -o Dpkg::Use-Pty=0 update
+          sudo apt-get -o Dpkg::Use-Pty=0 install -y \
+            libtool autoconf automake pkgconf libpsl-dev zlib1g-dev libbrotli-dev libzstd-dev libnghttp2-dev
+
+      - name: Normalize source mtimes to commit dates
+        run: |
+          python3 << 'PYEOF'
+          import subprocess, os, time
+          log = subprocess.run(['git','log','--format=%ct','--name-only'], capture_output=True, text=True).stdout
+          seen = set(); cur = None; stamped = 0
+          for line in log.splitlines():
+              if not line: continue
+              if line.isdigit():
+                  cur = int(line); continue
+              f = line
+              if f in seen or not os.path.exists(f): continue
+              os.utime(f, (cur, cur)); seen.add(f); stamped += 1
+          print(f"stamped {stamped} files")
+          ts = sorted(os.stat(f).st_mtime for f in seen)
+          print("  min:", time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts[0])))
+          print("  max:", time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(ts[-1])))
+          print("  now:", time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()))
+          PYEOF
+          git update-index --really-refresh > /dev/null 2>&1 || true
+          echo "RESULT mtime_norm done"
+
+      - name: 'cache mbedtls (latest)'
+        id: cache-mbedtls
+        uses: actions/cache@v6
+        with:
+          path: ~/pkg/mbedtls
+          key: bench-${{ runner.os }}-mbedtls-${{ env.MBEDTLS_VERSION }}-${{ runner.arch }}
+
+      - name: 'cache build tree (bld/)'
+        id: cache-bld
+        uses: actions/cache@v6
+        with:
+          path: bld/
+          key: bench-bld-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: |
+            bench-bld-${{ runner.arch }}-
+
+      - name: 'build mbedtls (latest)'
+        if: steps.cache-mbedtls.outputs.cache-hit != 'true'
+        run: |
+          cd "$HOME"
+          curl --disable --fail --silent --show-error --connect-timeout 15 --max-time 120 --retry 6 --retry-connrefused \
+            --location --proto-redir =https "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/mbedtls-${MBEDTLS_VERSION}.tar.bz2" --output pkg.bin
+          sha256sum pkg.bin && tar -xjf pkg.bin && rm -f pkg.bin
+          cd "mbedtls-${MBEDTLS_VERSION}"
+          ./scripts/config.py set MBEDTLS_THREADING_C
+          ./scripts/config.py set MBEDTLS_THREADING_PTHREAD
+          cmake -B . -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_INSTALL_PREFIX="$HOME"/pkg/mbedtls \
+            -DENABLE_PROGRAMS=OFF -DENABLE_TESTING=OFF
+          cmake --build .
+          cmake --install .
+
+      - name: Record cache states
+        run: |
+          echo "RESULT dep_cache hit=${{ steps.cache-mbedtls.outputs.cache-hit }}"
+          echo "RESULT bld_cache hit=${{ steps.cache-bld.outputs.cache-hit }} key=${{ steps.cache-bld.outputs.cache-matched-key }}"
+
+      - name: "Build curl (incremental via mtime normalization)"
+        env:
+          LDFLAGS: -Wl,-rpath,/home/runner/pkg/mbedtls/lib
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          STAMP=$(( $(git log -1 --format=%ct HEAD) - 30 ))
+          T0=$(date +%s%3N)
+          if [ -f bld/Makefile ] && [ configure.ac -ot bld/Makefile ]; then
+            find bld -type f -exec touch -d @$STAMP {} +
+            git ls-files --others --exclude-standard -z | xargs -0 -r touch -d @$STAMP
+            git ls-files --others --ignored --exclude-standard -z | xargs -0 -r touch -d @$STAMP
+            make -C bld V=1 AUTOCONF=true AUTOMAKE=true AUTOHEADER=true
+            find bld -type f -exec touch {} +
+          else
+            autoreconf -fi
+            mkdir bld && cd bld
+            ../configure --prefix="$HOME"/curl-install --enable-unity --enable-warnings --enable-werror --disable-static \
+              --disable-dependency-tracking --enable-option-checking=fatal \
+              --with-mbedtls="$HOME"/pkg/mbedtls --enable-debug
+            cd ..
+            find bld -type f -exec touch -d @$STAMP {} +
+            make -C bld V=1
+            find bld -type f -exec touch {} +
+          fi
+          E=$(date +%s%3N)
+          echo "RESULT phase=make ms=$((E-T0))"
+          echo "RESULT phase=curl_build ms=$((E-T0))"
+
+      - name: Verify curl binary
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          test -x bld/src/curl || { echo "FAIL: no binary"; ls bld/src/ | head; exit 1; }
+          bld/src/curl --disable -V | head -2
+          echo "RESULT phase=verify ok=1"
+
+      - name: Record cache usage
+        run: |
+          U=$(curl -s -H "Authorization: Bearer $GITHUB_TOKEN" \
+            "https://api.github.com/repos/davdhacs/curl-opt-arm/actions/cache/usage")
+          printf 'RESULT quota_bytes=%s\n' "$(printf %s "$U" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("active_caches_size_in_bytes",""))')"
+          cat "$RUNNER_TEMP/runner.txt" "$RUNNER_TEMP/calib.txt" 2>/dev/null || true
